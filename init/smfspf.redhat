@@ -1,20 +1,20 @@
 #!/bin/sh
 # Startup script for smf-spf milter
 #
-# chkconfig: 2345 75 35
-# description: Run smf-spf milter that realize the SPF technology
+# chkconfig: - 75 25
+# description: Run smf-spf milter that realizes the SPF technology
 
 # Source function library.
 . /etc/rc.d/init.d/functions
 
-[ -f /usr/local/sbin/smf-spf ] || exit 0
+[ -f /usr/sbin/smf-spf ] || exit 0
 
 prog="smf-spf"
 LOCKFILE=/var/lock/subsys/$prog
 
 start() {
     echo -n $"Starting $prog: " 
-    daemon /usr/local/sbin/smf-spf
+    daemon /usr/sbin/smf-spf
     RETVAL=$?
     touch $LOCKFILE
     echo

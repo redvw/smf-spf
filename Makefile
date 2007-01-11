@@ -1,14 +1,14 @@
 CC = gcc
-PREFIX = /usr/local
+PREFIX = /usr
 SBINDIR = $(PREFIX)/sbin
 DATADIR = /var/run/smfs
 CONFDIR = /etc/mail/smfs
 USER = smfs
 GROUP = smfs
-CFLAGS = -O2 -D_REENTRANT -fomit-frame-pointer -I/usr/local/include
+CFLAGS = $(OPTFLAGS) -D_REENTRANT -fomit-frame-pointer
 
 # Linux
-LDFLAGS = -lmilter -lpthread -L/usr/local/lib -lspf2
+LDFLAGS = -lmilter -lpthread -lspf2
 
 # FreeBSD
 #LDFLAGS = -lmilter -pthread -L/usr/local/lib -lspf2
@@ -23,7 +23,6 @@ all: smf-spf
 
 smf-spf: smf-spf.o
 	$(CC) -o smf-spf smf-spf.o $(LDFLAGS)
-	strip smf-spf
 
 smf-spf.o: smf-spf.c
 	$(CC) $(CFLAGS) -c smf-spf.c
