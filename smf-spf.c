@@ -31,16 +31,16 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <pwd.h>
-#include <regex.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/socket.h>
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
-#include "spf2/spf.h"
+#include <spf2/spf.h>
 
 #define CONFIG_FILE		"/etc/mail/smfs/smf-spf.conf"
 #define WORK_SPACE		"/var/run/smfs"
@@ -58,7 +58,7 @@
 #define MAXLINE			128
 #define HASH_POWER		16
 #define FACILITIES_AMOUNT	10
-#define IPV4_DOT_DECIMAL	"^[0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}$"
+#define REJECT_FMT              "Rejected, look at http://www.openspf.org/why.html?sender=%s&ip=%s&receiver=%s"
 
 #define SAFE_FREE(x)		if (x) { free(x); x = NULL; }
 
@@ -108,8 +108,9 @@ typedef struct cache_item {
 } cache_item;
 
 typedef struct CIDR {
-    unsigned long ip;
+    unsigned char ip[16];
     unsigned short int mask;
+    sa_family_t addr_family;
     struct CIDR *next;
 } CIDR;
 
@@ -142,6 +143,7 @@ typedef struct facilities {
 
 struct context {
     char addr[64];
+    sa_family_t addr_family;
     char fqdn[MAXLINE];
     char site[MAXLINE];
     char helo[MAXLINE];
@@ -155,7 +157,6 @@ struct context {
     SPF_result_t status;
 };
 
-static regex_t re_ipv4;
 static cache_item **cache = NULL;
 static const char *config_file = CONFIG_FILE;
 static config conf;
@@ -172,6 +173,7 @@ static facilities syslog_facilities[] = {
     { "local6", LOG_LOCAL6 },
     { "local7", LOG_LOCAL7 }
 };
+static const char * const reject_fmt = REJECT_FMT;
 
 static sfsistat smf_connect(SMFICTX *, char *, _SOCK_ADDR *);
 static sfsistat smf_helo(SMFICTX *, char *);
@@ -374,28 +376,43 @@ static int load_config(void) {
 	if ((p = strchr(buf, '#'))) *p = '\0';
 	if (!(strlen(buf))) continue;
 	if (sscanf(buf, "%127s %127s", key, val) != 2) continue;
-	if (!strcasecmp(key, "whitelistip")) {
+	if (!strncasecmp(key, "whitelistip", 11)) {
 	    char *slash = NULL;
-	    unsigned short int mask = 32;
+	    unsigned short int mask;
+	    int ipv6 = 0;
+	    struct in_addr sin_addr;
+	    struct in6_addr sin6_addr;
 
+	    if (!strcmp(key+11, "6"))
+	        ipv6 = 1;
+	    else if (key[11] != '\0')
+	        continue;
+
+	    mask = (ipv6 == 1) ? 128 : 32;
 	    if ((slash = strchr(val, '/'))) {
+	        unsigned short int nbits = mask;
 		*slash = '\0';
-		if ((mask = atoi(++slash)) > 32) mask = 32;
+		if ((mask = atoi(++slash)) > nbits) mask = nbits;
 	    }
-	    if (val[0] && !regexec(&re_ipv4, val, 0, NULL, 0)) {
-		CIDR *it = NULL;
-		unsigned long ip;
+	    if (val[0] &&
+		((ipv6 == 0 && inet_pton(AF_INET,  val, &sin_addr) > 0) ||
+		 (ipv6 == 1 && inet_pton(AF_INET6, val, &sin6_addr) > 0))) {
 
-		if ((ip = inet_addr(val)) == 0xffffffff) continue;
+	        CIDR *it = (CIDR *) calloc(1, sizeof(CIDR));
 		if (!conf.cidrs)
-		    conf.cidrs = (CIDR *) calloc(1, sizeof(CIDR));
-		else
-		    if ((it = (CIDR *) calloc(1, sizeof(CIDR)))) {
+		  conf.cidrs = it;
+		else if (it) {
 			it->next = conf.cidrs;
 			conf.cidrs = it;
 		    }
 		if (conf.cidrs) {
-		    conf.cidrs->ip = ip;
+		    if( ipv6 == 0 ) {
+		        memcpy(conf.cidrs->ip, &sin_addr.s_addr, 4);
+			conf.cidrs->addr_family = AF_INET;
+		    } else {
+		        memcpy(conf.cidrs->ip, sin6_addr.s6_addr, 16);
+			conf.cidrs->addr_family = AF_INET6;
+		    }
 		    conf.cidrs->mask = mask;
 		}
 	    }
@@ -499,24 +516,48 @@ static int load_config(void) {
     return 1;
 }
 
-static int ip_cidr(const unsigned long ip, const short int mask, const unsigned long checkip) {
-    unsigned long ipaddr = 0;
-    unsigned long cidrip = 0;
-    unsigned long subnet = 0;
+/*
+ * int
+ * bitncmp(l, r, n)
+ *      compare bit masks l and r, for n bits.
+ * return:
+ *      -1, 1, or 0 in the libc tradition.
+ * note:
+ *      network byte order assumed.  this means 192.5.5.240/28 has
+ *      0x11110000 in its fourth octet.
+ * author:
+ *      Paul Vixie (ISC), June 1996
+ */
+static int bitncmp(const void *l, const void *r, int n)
+{
+  unsigned int lb, rb;
+  int x, b;
+ 
+  b = n / 8;
+  x = memcmp(l, r, b);
+  if (x)
+    return x;
 
-    subnet = ~0;
-    subnet = subnet << (32 - mask);
-    cidrip = htonl(ip) & subnet;
-    ipaddr = ntohl(checkip) & subnet;
-    if (cidrip == ipaddr) return 1;
+  lb = ((const unsigned char *)l)[b];
+  rb = ((const unsigned char *)r)[b];
+  for (b = n % 8; b > 0; b--) {
+    if ((lb & 0x80) != (rb & 0x80)) {
+      if (lb & 0x80)
+	return 1;
+      return -1;
+    }
+    lb <<= 1;
+    rb <<= 1;
+  }
     return 0;
 }
 
-static int ip_check(const unsigned long checkip) {
+static int ip_check(const unsigned char *checkaddr, sa_family_t addr_family) {
     CIDR *it = conf.cidrs;
 
     while (it) {
-	if (ip_cidr(it->ip, it->mask, checkip)) return 1;
+      if (it->addr_family == addr_family &&
+	  bitncmp(it->ip, checkaddr, it->mask) == 0) return 1;
 	it = it->next;
     }
     return 0;
@@ -601,23 +642,35 @@ static void add_rcpt(struct context *context) {
 static sfsistat smf_connect(SMFICTX *ctx, char *name, _SOCK_ADDR *sa) {
     struct context *context = NULL;
     char host[64];
+    sa_family_t addr_family;
+    unsigned char in_addr[16];
 
+    if (sa == NULL) {
+      syslog(LOG_INFO, "Connect from sdin, filter skipped" );
+      return SMFIS_ACCEPT;
+    }
     strscpy(host, "undefined", sizeof(host) - 1);
-    switch (sa->sa_family) {
+    addr_family = sa->sa_family;
+    switch (addr_family) {
 	case AF_INET: {
 	    struct sockaddr_in *sin = (struct sockaddr_in *)sa;
 
-	    inet_ntop(AF_INET, &sin->sin_addr.s_addr, host, sizeof(host));
+	    memcpy(in_addr, &sin->sin_addr.s_addr, 4);
+	    inet_ntop(AF_INET, in_addr, host, sizeof(host));
 	    break;
 	}
 	case AF_INET6: {
 	    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sa;
 
-	    inet_ntop(AF_INET6, &sin6->sin6_addr, host, sizeof(host));
+	    memcpy(in_addr, sin6->sin6_addr.s6_addr, 16);
+	    inet_ntop(AF_INET6, in_addr, host, sizeof(host));
 	    break;
 	}
+        default:
+            syslog(LOG_INFO, "Unknown connection type, filter skipped" );
+            return SMFIS_ACCEPT;
     }
-    if (conf.cidrs && ip_check(inet_addr(host))) return SMFIS_ACCEPT;
+    if (conf.cidrs && ip_check(in_addr, addr_family)) return SMFIS_ACCEPT;
     if (conf.ptrs && ptr_check(name)) return SMFIS_ACCEPT;
     if (!(context = calloc(1, sizeof(*context)))) {
 	syslog(LOG_ERR, "[ERROR] %s", strerror(errno));
@@ -627,6 +680,7 @@ static sfsistat smf_connect(SMFICTX *ctx, char *name, _SOCK_ADDR *sa) {
     strscpy(context->addr, host, sizeof(context->addr) - 1);
     strscpy(context->fqdn, name, sizeof(context->fqdn) - 1);
     strscpy(context->helo, "undefined", sizeof(context->helo) - 1);
+    context->addr_family = addr_family;
     return SMFIS_CONTINUE;
 }
 
@@ -634,6 +688,7 @@ static sfsistat smf_helo(SMFICTX *ctx, char *arg) {
     struct context *context = (struct context *)smfi_getpriv(ctx);
 
     strscpy(context->helo, arg, sizeof(context->helo) - 1);
+    /* TODO: add HELO checks */
     return SMFIS_CONTINUE;
 }
 
@@ -689,7 +744,7 @@ static sfsistat smf_envfrom(SMFICTX *ctx, char **args) {
 	    if (status == SPF_RESULT_FAIL && conf.refuse_fail && !conf.tos) {
 		char reject[2 * MAXLINE];
 
-		snprintf(reject, sizeof(reject), "Rejected, look at http://www.openspf.org/why.html?sender=%s&ip=%s&receiver=%s", context->sender, context->addr, context->site);
+		snprintf(reject, sizeof(reject), reject_fmt, context->sender, context->addr, context->site);
 		smfi_setreply(ctx, "550", "5.7.1", reject);
 		return SMFIS_REJECT;
 	    }
@@ -703,10 +758,15 @@ static sfsistat smf_envfrom(SMFICTX *ctx, char **args) {
     }
     SPF_server_set_rec_dom(spf_server, context->site);
     if (!(spf_request = SPF_request_new(spf_server))) goto done;
+    if (context->addr_family == AF_INET) {
     SPF_request_set_ipv4_str(spf_request, context->addr);
+    } else {
+        SPF_request_set_ipv6_str(spf_request, context->addr);
+    }
     SPF_request_set_helo_dom(spf_request, context->helo);
     SPF_request_set_env_from(spf_request, context->sender);
     if (SPF_request_query_mailfrom(spf_request, &spf_response)) {
+      /* BUG: non-zero return doesn't ncessarily mean SPF none */
 	syslog(LOG_INFO, "SPF none: %s, %s, %s, %s", context->addr, context->fqdn, context->helo, context->from);
 	if (cache && conf.spf_ttl) {
 	    mutex_lock(&cache_mutex);
@@ -736,7 +796,7 @@ static sfsistat smf_envfrom(SMFICTX *ctx, char **args) {
     if (status == SPF_RESULT_FAIL && conf.refuse_fail && !conf.tos) {
 	char reject[2 * MAXLINE];
 
-	snprintf(reject, sizeof(reject), "Rejected, look at http://www.openspf.org/why.html?sender=%s&ip=%s&receiver=%s", context->sender, context->addr, context->site);
+	snprintf(reject, sizeof(reject), reject_fmt, context->sender, context->addr, context->site);
 	if (spf_response) SPF_response_free(spf_response);
 	if (spf_request) SPF_request_free(spf_request);
 	if (spf_server) SPF_server_free(spf_server);
@@ -764,7 +824,7 @@ static sfsistat smf_envrcpt(SMFICTX *ctx, char **args) {
 	if (context->status == SPF_RESULT_FAIL && conf.refuse_fail) {
 	    char reject[2 * MAXLINE];
 
-	    snprintf(reject, sizeof(reject), "Rejected, look at http://www.openspf.org/why.html?sender=%s&ip=%s&receiver=%s", context->sender, context->addr, context->site);
+	    snprintf(reject, sizeof(reject), reject_fmt, context->sender, context->addr, context->site);
 	    smfi_setreply(ctx, "550", "5.1.1", reject);
 	    return SMFIS_REJECT;
 	}
@@ -807,6 +867,7 @@ static sfsistat smf_eom(SMFICTX *ctx) {
     if (conf.add_header) {
 	char *spf_hdr = NULL;
 
+	/* TODO: make verbosity configurable */
 	smfi_addheader(ctx, "X-SPF-Scan-By", "smf-spf v2.0.2 - http://smfs.sf.net/");
 	if ((spf_hdr = calloc(1, 512))) {
 	    switch (context->status) {
@@ -832,6 +893,7 @@ static sfsistat smf_eom(SMFICTX *ctx) {
 			context->site, context->sender, context->site, context->addr, context->from, context->helo);
 		    break;
 	    }
+	    /* BUG? should be smfi_insheader to go above Received:, as it should per RFC */
 	    smfi_addheader(ctx, "Received-SPF", spf_hdr);
 	    free(spf_hdr);
 	}
@@ -905,7 +967,6 @@ int main(int argc, char **argv) {
 	}
     }
     memset(&conf, 0, sizeof(conf));
-    regcomp(&re_ipv4, IPV4_DOT_DECIMAL, REG_EXTENDED|REG_ICASE);
     if (!load_config()) fprintf(stderr, "Warning: smf-spf configuration file load failed\n");
     tzset();
     openlog("smf-spf", LOG_PID|LOG_NDELAY, conf.syslog_facility);
