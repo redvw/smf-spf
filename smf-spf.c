@@ -1,4 +1,5 @@
 /*  Copyright (C) 2005, 2006 by Eugene Kurmanin <me@kurmanin.info>
+ *  Modifications (C) 2009 Ole Hansen <ole@redvw.com>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -33,6 +34,7 @@
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -51,14 +53,30 @@
 #define SYSLOG_FACILITY		LOG_MAIL
 #define SPF_TTL			3600
 #define REFUSE_FAIL		1
+#define REJECT_TEMPERROR	1
+#define REJECT_PERMERROR	0
 #define TAG_SUBJECT		1
-#define ADD_HEADER		1
+#define RECEIVED_HDRFMT         0xFF
+#define ADD_SIGNATURE           1
+#define ADD_AUTHRESULT          0
+#define WRAP_HEADER             1
+#define HEADER_WIDTH            78
 #define QUARANTINE		0
 
 #define MAXLINE			128
 #define HASH_POWER		16
 #define FACILITIES_AMOUNT	10
-#define REJECT_FMT              "Rejected, look at http://www.openspf.org/why.html?sender=%s&ip=%s&receiver=%s"
+#define NOJOBID                 "(unknown jobid)"
+
+#define SMF_SPF_HDRFMT_RESULT   0x01
+#define SMF_SPF_HDRFMT_TXT      0x02
+#define SMF_SPF_HDRFMT_RECEIVER 0x04
+#define SMF_SPF_HDRFMT_CLIENTIP 0x08
+#define SMF_SPF_HDRFMT_ENVFROM  0x10
+#define SMF_SPF_HDRFMT_HELO     0x20
+
+#define SMF_SPF_AUTHFMT_RESULT  0x01
+#define SMF_SPF_AUTHFMT_VERBOSE 0x02
 
 #define SAFE_FREE(x)		if (x) { free(x); x = NULL; }
 
@@ -99,10 +117,15 @@ int daemon(int nochdir, int noclose) {
 }
 #endif
 
+typedef struct cache_data {
+    SPF_result_t status;
+    SPF_errcode_t errcode;
+} cache_data;
+
 typedef struct cache_item {
     char *item;
     unsigned long hash;
-    SPF_result_t status;
+    cache_data data;
     time_t exptime;
     struct cache_item *next;
 } cache_item;
@@ -129,8 +152,14 @@ typedef struct config {
     STR *froms;
     STR *tos;
     int refuse_fail;
+    int reject_temperror;
+    int reject_permerror;
     int tag_subject;
-    int add_header;
+    int received_header_format;
+    int add_signature_header;
+    int add_authresult_header;
+    int wrap_header;
+    int header_width;
     int quarantine;
     int syslog_facility;
     unsigned long spf_ttl;
@@ -153,8 +182,10 @@ struct context {
     char recipient[MAXLINE];
     char key[MAXLINE];
     char *subject;
+    char *jobid;
     STR *rcpts;
     SPF_result_t status;
+    SPF_errcode_t errcode;
 };
 
 static cache_item **cache = NULL;
@@ -173,7 +204,6 @@ static facilities syslog_facilities[] = {
     { "local6", LOG_LOCAL6 },
     { "local7", LOG_LOCAL7 }
 };
-static const char * const reject_fmt = REJECT_FMT;
 
 static sfsistat smf_connect(SMFICTX *, char *, _SOCK_ADDR *);
 static sfsistat smf_helo(SMFICTX *, char *);
@@ -194,6 +224,15 @@ static void strtolower(register char *str) {
 
     for (; *str; str++)
 	if (isascii(*str) && isupper(*str)) *str = tolower(*str);
+}
+
+static int check_yesno(const char *key, const char *val) {
+    if (val[0] == 'y' || val[0] == 'Y' || val[0] == 't' || val[0] == 'T' || !strcasecmp(val, "on"))
+        return 1;
+    if (val[0] == 'n' || val[0] == 'N' || val[0] == 'f' || val[0] == 'F' || !strncasecmp(val, "off", 2))
+        return 0;
+    fprintf(stderr, "Warning: unrecognized configuration value: key=%s, val=%s. Assuming \"off\"\n", key, val);
+    return 0;
 }
 
 static unsigned long translate(char *value) {
@@ -222,7 +261,7 @@ static unsigned long translate(char *value) {
     return (atol(value) * unit);
 }
 
-static unsigned long hash_code(register const unsigned char *key) {
+static unsigned long hash_code(register const char *key) {
     register unsigned long hash = 0;
     register size_t i, len = strlen(key);
 
@@ -259,19 +298,19 @@ static void cache_destroy(void) {
     SAFE_FREE(cache);
 }
 
-static SPF_result_t cache_get(const char *key) {
+static struct cache_data *cache_get(const char *key) {
     unsigned long hash = hash_code(key);
     cache_item *it = cache[hash & hash_mask(HASH_POWER)];
     time_t curtime = time(NULL);
 
     while (it) {
-	if (it->hash == hash && it->exptime > curtime && it->item && !strcmp(key, it->item)) return it->status;
+	if (it->hash == hash && it->exptime > curtime && it->item && !strcmp(key, it->item)) return &(it->data);
 	it = it->next;
     }
-    return SPF_RESULT_INVALID;
+    return NULL;
 }
 
-static void cache_put(const char *key, unsigned long ttl, SPF_result_t status) {
+static void cache_put(const char *key, unsigned long ttl, SPF_result_t status, SPF_errcode_t errcode) {
     unsigned long hash = hash_code(key);
     time_t curtime = time(NULL);
     cache_item *it, *parent = NULL;
@@ -287,7 +326,8 @@ static void cache_put(const char *key, unsigned long ttl, SPF_result_t status) {
 	    SAFE_FREE(it->item);
 	    it->item = strdup(key);
 	    it->hash = hash;
-	    it->status = status;
+	    it->data.status = status;
+	    it->data.errcode = errcode;
 	    it->exptime = curtime + ttl;
 	    return;
 	}
@@ -297,7 +337,8 @@ static void cache_put(const char *key, unsigned long ttl, SPF_result_t status) {
     if ((it = (cache_item *) calloc(1, sizeof(cache_item)))) {
 	it->item = strdup(key);
 	it->hash = hash;
-	it->status = status;
+	it->data.status = status;
+	it->data.errcode = errcode;
 	it->exptime = curtime + ttl;
 	if (parent)
 	    parent->next = it;
@@ -363,8 +404,14 @@ static int load_config(void) {
     conf.sendmail_socket = strdup(OCONN);
     conf.syslog_facility = SYSLOG_FACILITY;
     conf.refuse_fail = REFUSE_FAIL;
+    conf.reject_temperror = REJECT_TEMPERROR;
+    conf.reject_permerror = REJECT_PERMERROR;
     conf.tag_subject = TAG_SUBJECT;
-    conf.add_header = ADD_HEADER;
+    conf.received_header_format = RECEIVED_HDRFMT;
+    conf.add_signature_header = ADD_SIGNATURE;
+    conf.add_authresult_header = ADD_AUTHRESULT;
+    conf.wrap_header = WRAP_HEADER;
+    conf.header_width = HEADER_WIDTH;
     conf.quarantine = QUARANTINE;
     conf.spf_ttl = SPF_TTL;
     if (!(fp = fopen(config_file, "r"))) return 0;
@@ -402,9 +449,9 @@ static int load_config(void) {
 		if (!conf.cidrs)
 		  conf.cidrs = it;
 		else if (it) {
-			it->next = conf.cidrs;
-			conf.cidrs = it;
-		    }
+		    it->next = conf.cidrs;
+		    conf.cidrs = it;
+		}
 		if (conf.cidrs) {
 		    if( ipv6 == 0 ) {
 		        memcpy(conf.cidrs->ip, &sin_addr.s_addr, 4);
@@ -463,12 +510,20 @@ static int load_config(void) {
 	    }
 	    continue;
 	}
-	if (!strcasecmp(key, "refusefail") && !strcasecmp(val, "off")) {
-	    conf.refuse_fail = 0;
+	if (!strcasecmp(key, "refusefail")) {
+	    conf.refuse_fail = check_yesno(key, val);
 	    continue;
 	}
-	if (!strcasecmp(key, "tagsubject") && !strcasecmp(val, "off")) {
-	    conf.tag_subject = 0;
+	if (!strcasecmp(key, "rejecttemperror")) {
+	    conf.reject_temperror = check_yesno(key, val);
+	    continue;
+	}
+	if (!strcasecmp(key, "rejectpermerror")) {
+	    conf.reject_permerror = check_yesno(key, val);
+	    continue;
+	}
+	if (!strcasecmp(key, "tagsubject")) {
+	    conf.tag_subject = check_yesno(key, val);
 	    continue;
 	}
 	if (!strcasecmp(key, "tag")) {
@@ -476,12 +531,80 @@ static int load_config(void) {
 	    conf.tag = strdup(val);
 	    continue;
 	}
-	if (!strcasecmp(key, "addheader") && !strcasecmp(val, "off")) {
-	    conf.add_header = 0;
+	if (!strcasecmp(key, "addheader")) {
+	    char *tok, *str;
+	    conf.received_header_format = 0;
+	    for (str = val; ; str=NULL ) {
+	        tok = strtok(str, ",");
+		if (tok == NULL) break;
+		while (*tok && isspace(*tok)) tok++;
+		if (*tok == '\0') continue;
+		if (!strncasecmp(tok, "off", 2) ||
+		    !strncasecmp(tok, "false", 1) ||
+		    !strncasecmp(tok, "no", 1)) {
+		    conf.received_header_format = 0;
+		    break;
+		} else if (!strcasecmp(tok, "on") ||
+			   !strncasecmp(tok, "true", 1) ||
+			   !strncasecmp(tok, "yes", 1)) {
+		    conf.received_header_format = RECEIVED_HDRFMT;
+		    break;
+		} else if (!strncasecmp(tok, "result", 3)) {
+		     conf.received_header_format |= SMF_SPF_HDRFMT_RESULT;
+		} else if (!strncasecmp(tok, "description", 1) ||
+			   !strncasecmp(tok, "verbose", 1)) {
+		    conf.received_header_format |= SMF_SPF_HDRFMT_TXT;
+		} else if (!strncasecmp(tok, "receiver", 3)) {
+		    conf.received_header_format |= SMF_SPF_HDRFMT_RECEIVER;
+		} else if (!strncasecmp(tok, "clientip", 1) ||
+			   !strncasecmp(tok, "ip", 1)) {
+		    conf.received_header_format |= SMF_SPF_HDRFMT_CLIENTIP;
+		} else if (!strncasecmp(tok, "envfrom", 1)) {
+		    conf.received_header_format |= SMF_SPF_HDRFMT_ENVFROM;
+		} else if (!strncasecmp(tok, "helo", 1)) {
+		    conf.received_header_format |= SMF_SPF_HDRFMT_HELO;
+		} else {
+		    fprintf(stderr, "Warning: unknown configuration token, key=%s, val=%s, tok=%s\n", key, val, tok);
+		}
+	    }
+	    if (conf.received_header_format)
+		conf.received_header_format |= SMF_SPF_HDRFMT_RESULT;
 	    continue;
 	}
-	if (!strcasecmp(key, "quarantine") && !strcasecmp(val, "on")) {
-	    conf.quarantine = 1;
+	if (!strcasecmp(key, "addauthresultheader")) {
+	    conf.add_authresult_header = 0;
+	    if (!strncasecmp(val, "off", 2) ||
+		!strncasecmp(val, "false", 1) ||
+		!strncasecmp(val, "no", 1)) {
+		conf.add_authresult_header = 0;
+	    } else if (!strcasecmp(val, "on") ||
+		       !strncasecmp(val, "true", 1) ||
+		       !strncasecmp(val, "yes", 1)) {
+		conf.add_authresult_header = SMF_SPF_AUTHFMT_RESULT;
+	    } else if (!strncasecmp(val, "verbose", 1)) {
+		conf.add_authresult_header = SMF_SPF_AUTHFMT_VERBOSE;
+	    } else {
+		fprintf(stderr, "Warning: unknown configuration value, key=%s, val=%s\n", key, val);
+	    }
+	    continue;
+	}
+	if (!strcasecmp(key, "addsignatureheader")) {
+	    conf.add_signature_header = check_yesno(key, val);
+	    continue;
+	}
+	if (!strcasecmp(key, "wrapheader")) {
+	    conf.wrap_header = check_yesno(key, val);
+	    continue;
+	}
+	if (!strcasecmp(key, "headerwidth")) {
+	    conf.header_width = atoi(val);
+	    if (conf.header_width > 998 || conf.header_width < 64) {
+		conf.header_width = HEADER_WIDTH;
+	    }
+	    continue;
+	}
+	if (!strcasecmp(key, "quarantine")) {
+	    conf.quarantine = check_yesno(key, val);
 	    continue;
 	}
 	if (!strcasecmp(key, "quarantinebox")) {
@@ -549,7 +672,7 @@ static int bitncmp(const void *l, const void *r, int n)
     lb <<= 1;
     rb <<= 1;
   }
-    return 0;
+  return 0;
 }
 
 static int ip_check(const unsigned char *checkaddr, sa_family_t addr_family) {
@@ -639,6 +762,258 @@ static void add_rcpt(struct context *context) {
     if (context->rcpts && !context->rcpts->str) context->rcpts->str = strdup(context->rcpt);
 }
 
+static void wrap_header(char* header, size_t len, size_t indent, size_t width) {
+    const size_t tab = 8;
+    size_t nchars, pos;
+    char *buf, *p, *q, *start;
+    int buflen, spc, newchars, startline;
+
+    if (!header || indent>=width || width<2*tab)
+        return;
+
+    nchars = strlen(header);
+    if ((nchars+indent) < width )
+        return;
+
+    buflen = nchars+1+2*(nchars/(width-tab)+1);
+    if (buflen>len)
+        return;
+    buf = (char*)malloc(buflen);
+    if (!buf)
+        return;
+
+    start = p = header;
+    q = buf;
+    pos = indent+1;
+    newchars = spc = 0;
+    startline = 1;
+    while (*p) {
+        if (*p == ' ') {
+	    if (newchars) {
+	        strncpy(q, start, p-start);
+		q += p-start;
+		newchars = 0;
+		if (spc) {
+		    pos++;
+		}
+	    }
+	    if (!startline) {
+	        start = p;
+		spc = 1;
+	    }
+	} else {
+	    if (startline) {
+	        start = p;
+		startline = 0;
+	    }
+	    newchars = 1;
+	    pos++;
+	}
+	p++;
+	if (pos>width) {
+	    pos = tab+1;
+	    if (spc) {
+	        strcpy(q, "\n\t");
+		q += 2;
+		start++;
+		startline = 1;
+	    }
+	    if (newchars) {
+	        strncpy(q, start, p-start);
+		q += p-start;
+		startline = 0;
+		newchars = 0;
+		if (spc) {
+		    pos += p-start;
+		}
+	    }
+	    if (!spc) {
+	        strcpy(q, "\n\t ");
+		q += 3;
+		startline = 2;
+		pos++;
+	    }
+	    start = p;
+	    spc = 0;
+	}
+    }
+    if (newchars) {
+        strncpy(q, start, p-start);
+	q += p-start;
+    } else if (startline && q != buf) {
+        q -= 2;
+	if (startline == 2) q--;
+    }
+    *q = '\0';
+    strcpy(header, buf);
+    free(buf);
+}
+
+static int safe_ret(size_t size, int nchars) {
+    if( nchars >= (int)size || nchars < 0 ) {
+        nchars = 0;
+    }
+    return nchars;
+}
+
+static SPF_result_t fixup_result(SPF_result_t status, SPF_errcode_t errcode)
+{
+    /* Buggy libspf2 often does not assign a result code in case of an error */
+    if (status == SPF_RESULT_INVALID) {
+	switch (errcode) {
+	case SPF_E_NOT_SPF:
+	    status = SPF_RESULT_NONE;
+	    break;
+	case SPF_E_NO_MEMORY:
+	case SPF_E_DNS_ERROR:  /* This combination may also be be a PERMERROR :-/ */
+	    status = SPF_RESULT_TEMPERROR;
+	    break;
+	/* These two deserve an "invalid" result code */
+	case SPF_E_INTERNAL_ERROR:
+	case SPF_E_UNINIT_VAR:
+	    break;
+	default:
+	    status = SPF_RESULT_PERMERROR;
+	    break;
+	}
+    }
+    return status;
+}
+
+static int write_spf_txt(char *spf_txt, size_t LEN, const struct context *context) {
+    int nchars = 0;
+
+    switch (context->status) {
+    case SPF_RESULT_PASS:
+        nchars = safe_ret(LEN, snprintf(spf_txt, LEN, " (%s: domain of %s designates %s as permitted sender)",
+					context->site, context->sender, context->addr));
+	break;
+    case SPF_RESULT_FAIL:
+        nchars = safe_ret(LEN, snprintf(spf_txt, LEN, " (%s: domain of %s does not designate %s as permitted sender)",
+					context->site, context->sender, context->addr));
+	break;
+    case SPF_RESULT_SOFTFAIL:
+        nchars = safe_ret(LEN, snprintf(spf_txt, LEN, " (%s: transitioning domain of %s does not designate %s as "
+					"permitted sender)", context->site, context->sender, context->addr));
+	break;
+    case SPF_RESULT_NEUTRAL:
+        nchars = safe_ret(LEN, snprintf(spf_txt, LEN, " (%s: sender %s is neither permitted nor denied by domain of %s)",
+					context->site, context->addr, context->sender));
+	break;
+    case SPF_RESULT_NONE:
+	nchars = safe_ret(LEN, snprintf(spf_txt, LEN, " (%s: domain of %s does not designate permitted sender hosts)",
+					context->site, context->sender));
+	break;
+    case SPF_RESULT_TEMPERROR:
+	nchars = safe_ret(LEN, snprintf(spf_txt, LEN, " (%s: error in processing during lookup of %s: %s)",
+					context->site, context->sender, SPF_strerror(context->errcode)));
+    case SPF_RESULT_PERMERROR:
+	nchars = safe_ret(LEN, snprintf(spf_txt, LEN, " (%s: unrecoverable error during lookup of %s: %s)",
+					context->site, context->sender, SPF_strerror(context->errcode)));
+    default:
+        break;
+    }
+    return nchars;
+}
+
+static void insert_headers(SMFICTX *ctx, const struct context *context) {
+    const size_t LEN = 974;
+    size_t pos = 0;
+    const char *spf_result = SPF_strresult(context->status);
+    char *spf_hdr = (char *)malloc(LEN);
+
+    if (!spf_hdr) {
+        return;
+    }
+
+    if (conf.received_header_format) {
+        *spf_hdr = 0;
+	pos = safe_ret(LEN, snprintf(spf_hdr, LEN, "%s", spf_result));
+        if (conf.received_header_format & SMF_SPF_HDRFMT_TXT) {
+	    pos += write_spf_txt(spf_hdr+pos, LEN-pos, context);
+	}
+        if (conf.received_header_format & SMF_SPF_HDRFMT_RECEIVER) {
+	    pos += safe_ret(LEN, snprintf(spf_hdr+pos, LEN-pos, " receiver=%s;", context->site));
+	}
+        if (conf.received_header_format & SMF_SPF_HDRFMT_CLIENTIP) {
+	    pos += safe_ret(LEN, snprintf(spf_hdr+pos, LEN-pos, " client-ip=%s;", context->addr));
+	}
+        if (conf.received_header_format & SMF_SPF_HDRFMT_ENVFROM) {
+	    /* As per erratum of the SPF RFC, the envelope-from is to be a quoted string */
+	    size_t len = strlen(context->from);
+	    char *quoted_from = (char*)malloc(len+3);
+	    if (quoted_from) {
+		const char *p = context->from;
+		if (len>0 && p[len-1] == '>') {
+		    len--;
+		}
+		if (*p == '<') {
+		    p++;
+		    len--;
+		}
+		*quoted_from = '"';
+		strncpy(quoted_from+1, p, len);
+		strcpy(quoted_from+len+1, "\"");
+		pos += safe_ret(LEN, snprintf(spf_hdr+pos, LEN-pos, " envelope-from=%s;", quoted_from));
+		free(quoted_from);
+	    }
+	}
+        if (conf.received_header_format & SMF_SPF_HDRFMT_HELO) {
+	    pos += safe_ret(LEN, snprintf(spf_hdr+pos, LEN-pos, " helo=%s;", context->helo));
+	}
+	if (conf.wrap_header) {
+	    wrap_header(spf_hdr, LEN, 14, conf.header_width);
+	}
+	smfi_insheader(ctx, 1, "Received-SPF", spf_hdr);
+    }
+
+    if (conf.add_authresult_header) {
+	const char *spf_authresult = spf_result;
+
+	/* Conform to RFC 5451 */
+	if (!strcmp(spf_authresult, "fail")) {
+	    spf_authresult = "hardfail";
+	}
+        *spf_hdr = 0;
+        pos = safe_ret(LEN, snprintf(spf_hdr, LEN, "%s; spf=%s", context->site, spf_authresult));
+	if (conf.add_authresult_header & SMF_SPF_AUTHFMT_VERBOSE) {
+	    pos += write_spf_txt(spf_hdr+pos, LEN-pos, context);
+	}
+	snprintf(spf_hdr+pos, LEN-pos, " smtp.mailfrom=%s", context->sender);
+	if (conf.wrap_header) {
+	    wrap_header(spf_hdr, LEN, 24, conf.header_width);
+	}
+	smfi_insheader(ctx, 1, "Authentication-Results", spf_hdr);
+    }
+
+    if (conf.add_signature_header) {
+        smfi_insheader(ctx, 1, "X-SPF-Scan-By", "smf-spf v2.1.0 - http://smfs.sf.net/");
+    }
+
+    free(spf_hdr);
+}
+
+static sfsistat check_reject(SPF_result_t status, SMFICTX *ctx, const struct context *context) {
+    if (status == SPF_RESULT_FAIL && conf.refuse_fail) {
+	char reject[2 * MAXLINE];
+	snprintf(reject, sizeof(reject), "Rejected. See http://www.openspf.org/why.html?sender=%s&ip=%s&receiver=%s",
+		 context->sender, context->addr, context->site);
+	smfi_setreply(ctx, "550", "5.7.1", reject);
+	return SMFIS_REJECT;
+    }
+    if (status == SPF_RESULT_TEMPERROR && conf.reject_temperror) {
+	smfi_setreply(ctx, "451", "4.4.3", "Please try again later");
+	return SMFIS_TEMPFAIL;
+    }
+    if (status == SPF_RESULT_PERMERROR && conf.reject_permerror) {
+	char reject[2 * MAXLINE];
+	snprintf(reject, sizeof(reject), "Bad sender SPF record: %s", SPF_strerror(context->errcode));
+	smfi_setreply(ctx, "550", "5.5.2", reject);
+	return SMFIS_REJECT;
+    }
+    return SMFIS_CONTINUE;
+}
+
 static sfsistat smf_connect(SMFICTX *ctx, char *name, _SOCK_ADDR *sa) {
     struct context *context = NULL;
     char host[64];
@@ -659,7 +1034,7 @@ static sfsistat smf_connect(SMFICTX *ctx, char *name, _SOCK_ADDR *sa) {
 	    inet_ntop(AF_INET, in_addr, host, sizeof(host));
 	    break;
 	}
-	case AF_INET6: {
+        case AF_INET6: {
 	    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sa;
 
 	    memcpy(in_addr, sin6->sin6_addr.s6_addr, 16);
@@ -681,6 +1056,8 @@ static sfsistat smf_connect(SMFICTX *ctx, char *name, _SOCK_ADDR *sa) {
     strscpy(context->fqdn, name, sizeof(context->fqdn) - 1);
     strscpy(context->helo, "undefined", sizeof(context->helo) - 1);
     context->addr_family = addr_family;
+    context->jobid = NOJOBID;
+
     return SMFIS_CONTINUE;
 }
 
@@ -688,7 +1065,6 @@ static sfsistat smf_helo(SMFICTX *ctx, char *arg) {
     struct context *context = (struct context *)smfi_getpriv(ctx);
 
     strscpy(context->helo, arg, sizeof(context->helo) - 1);
-    /* TODO: add HELO checks */
     return SMFIS_CONTINUE;
 }
 
@@ -699,10 +1075,17 @@ static sfsistat smf_envfrom(SMFICTX *ctx, char **args) {
     SPF_server_t *spf_server = NULL;
     SPF_request_t *spf_request = NULL;
     SPF_response_t *spf_response = NULL;
-    SPF_result_t status;
+    SPF_result_t status = SPF_RESULT_NONE;
+    SPF_errcode_t errcode = SPF_E_SUCCESS;
+    const cache_data *data = NULL;
+    const char *cache_notice = "";
 
     if (smfi_getsymval(ctx, "{auth_authen}")) return SMFIS_ACCEPT;
     if (verify && strcmp(verify, "OK") == 0) return SMFIS_ACCEPT;
+    context->jobid = smfi_getsymval(ctx, "i");
+    if (context->jobid == NULL) {
+	context->jobid = NOJOBID;
+    }
     if (*args) strscpy(context->from, *args, sizeof(context->from) - 1);
     if (strstr(context->from, "<>")) {
 	strtolower(context->helo);
@@ -717,9 +1100,9 @@ static sfsistat smf_envfrom(SMFICTX *ctx, char **args) {
 	strtolower(context->sender);
 	if (conf.froms && from_check(context->sender)) return SMFIS_ACCEPT;
     }
+    /* FIXME: should be done at end of message or in RCPT section */
     if (context->rcpts) {
 	STR *it = context->rcpts, *it_next;
-
 	while (it) {
 	    it_next = it->next;
 	    SAFE_FREE(it->str);
@@ -729,7 +1112,9 @@ static sfsistat smf_envfrom(SMFICTX *ctx, char **args) {
 	context->rcpts = NULL;
     }
     SAFE_FREE(context->subject);
+    /* ----- */
     context->status = SPF_RESULT_NONE;
+    context->errcode = SPF_E_SUCCESS;
     if ((site = smfi_getsymval(ctx, "j")))
 	strscpy(context->site, site, sizeof(context->site) - 1);
     else
@@ -737,76 +1122,66 @@ static sfsistat smf_envfrom(SMFICTX *ctx, char **args) {
     snprintf(context->key, sizeof(context->key), "%s|%s", context->addr, strchr(context->sender, '@') + 1);
     if (cache && conf.spf_ttl) {
 	mutex_lock(&cache_mutex);
-	status = cache_get(context->key);
+	data = cache_get(context->key);
 	mutex_unlock(&cache_mutex);
-	if (status != SPF_RESULT_INVALID) {
-	    syslog(LOG_INFO, "SPF %s (cached): %s, %s, %s, %s", SPF_strresult(status), context->addr, context->fqdn, context->helo, context->from);
-	    if (status == SPF_RESULT_FAIL && conf.refuse_fail && !conf.tos) {
-		char reject[2 * MAXLINE];
-
-		snprintf(reject, sizeof(reject), reject_fmt, context->sender, context->addr, context->site);
-		smfi_setreply(ctx, "550", "5.7.1", reject);
-		return SMFIS_REJECT;
-	    }
-	    context->status = status;
-	    return SMFIS_CONTINUE;
-	}
     }
-    if (!(spf_server = SPF_server_new(SPF_DNS_RESOLV, 0))) {
-	syslog(LOG_ERR, "[ERROR] SPF engine init failed");
-	return SMFIS_ACCEPT;
-    }
-    SPF_server_set_rec_dom(spf_server, context->site);
-    if (!(spf_request = SPF_request_new(spf_server))) goto done;
-    if (context->addr_family == AF_INET) {
-    SPF_request_set_ipv4_str(spf_request, context->addr);
+    if (data) {
+	status = data->status;
+	errcode = data->errcode;
+	cache_notice = " (cached)";
     } else {
-        SPF_request_set_ipv6_str(spf_request, context->addr);
-    }
-    SPF_request_set_helo_dom(spf_request, context->helo);
-    SPF_request_set_env_from(spf_request, context->sender);
-    if (SPF_request_query_mailfrom(spf_request, &spf_response)) {
-      /* BUG: non-zero return doesn't ncessarily mean SPF none */
-	syslog(LOG_INFO, "SPF none: %s, %s, %s, %s", context->addr, context->fqdn, context->helo, context->from);
-	if (cache && conf.spf_ttl) {
+	int badalloc = 1;
+	/* FIXME: start one single server at program startup */
+	if (!(spf_server = SPF_server_new(SPF_DNS_RESOLV, 0))) {
+	    syslog(LOG_ERR, "[ERROR] SPF engine init failed");
+	    return SMFIS_ACCEPT;
+	}
+	/* ----- */
+	SPF_server_set_rec_dom(spf_server, context->site);
+	if (!(spf_request = SPF_request_new(spf_server))) goto nomem;
+	if (context->addr_family == AF_INET) {
+	    SPF_request_set_ipv4_str(spf_request, context->addr);
+	} else {
+	    SPF_request_set_ipv6_str(spf_request, context->addr);
+	}
+	SPF_request_set_helo_dom(spf_request, context->helo);
+	SPF_request_set_env_from(spf_request, context->sender);
+	errcode = SPF_request_query_mailfrom(spf_request, &spf_response);
+	if (!spf_response) goto nomem;
+	status = SPF_response_result(spf_response);
+	status = fixup_result(status, errcode);
+	if (cache && conf.spf_ttl && status != SPF_RESULT_INVALID && status != SPF_RESULT_TEMPERROR) {
 	    mutex_lock(&cache_mutex);
-	    cache_put(context->key, conf.spf_ttl, SPF_RESULT_NONE);
+	    cache_put(context->key, conf.spf_ttl, status, errcode);
 	    mutex_unlock(&cache_mutex);
 	}
-	goto done;
-    }
-    if (!spf_response) goto done;
-    status = SPF_response_result(spf_response);
-    syslog(LOG_NOTICE, "SPF %s: %s, %s, %s, %s", SPF_strresult(status), context->addr, context->fqdn, context->helo, context->from);
-    switch (status) {
-	case SPF_RESULT_PASS:
-	case SPF_RESULT_FAIL:
-	case SPF_RESULT_SOFTFAIL:
-	case SPF_RESULT_NEUTRAL:
-	    context->status = status;
-	    if (cache && conf.spf_ttl) {
-		mutex_lock(&cache_mutex);
-		cache_put(context->key, conf.spf_ttl, context->status);
-		mutex_unlock(&cache_mutex);
-	    }
-	    break;
-	default:
-	    break;
-    }
-    if (status == SPF_RESULT_FAIL && conf.refuse_fail && !conf.tos) {
-	char reject[2 * MAXLINE];
-
-	snprintf(reject, sizeof(reject), reject_fmt, context->sender, context->addr, context->site);
+	badalloc = 0;
+    nomem:
 	if (spf_response) SPF_response_free(spf_response);
 	if (spf_request) SPF_request_free(spf_request);
 	if (spf_server) SPF_server_free(spf_server);
-	smfi_setreply(ctx, "550", "5.7.1", reject);
-	return SMFIS_REJECT;
+	if (badalloc) {
+	    status = SPF_RESULT_TEMPERROR;
+	    errcode = SPF_E_NO_MEMORY;
+	}
     }
-done:
-    if (spf_response) SPF_response_free(spf_response);
-    if (spf_request) SPF_request_free(spf_request);
-    if (spf_server) SPF_server_free(spf_server);
+    if (status == SPF_RESULT_INVALID || status == SPF_RESULT_PERMERROR || status == SPF_RESULT_TEMPERROR) {
+	syslog(LOG_NOTICE, "%s: SPF %s (%s)%s: %s, %s, %s, %s", context->jobid, SPF_strresult(status),
+	       SPF_strerror(errcode), cache_notice, context->addr, context->fqdn, context->helo, context->from);
+    } else {
+	syslog(LOG_NOTICE, "%s: SPF %s%s: %s, %s, %s, %s", context->jobid, SPF_strresult(status), cache_notice,
+	       context->addr, context->fqdn, context->helo, context->from);
+    }
+    if (!conf.tos) {
+	sfsistat ret;
+
+	if ((ret = check_reject(status, ctx, context)) != SMFIS_CONTINUE) {
+	    return ret;
+	}
+    }
+
+    context->status = status;
+    context->errcode = errcode;
     return SMFIS_CONTINUE;
 }
 
@@ -819,14 +1194,12 @@ static sfsistat smf_envrcpt(SMFICTX *ctx, char **args) {
 	return SMFIS_REJECT;
     }
     if (conf.tos) {
+	sfsistat ret;
+
 	strtolower(context->recipient);
 	if (to_check(context->recipient)) return SMFIS_CONTINUE;
-	if (context->status == SPF_RESULT_FAIL && conf.refuse_fail) {
-	    char reject[2 * MAXLINE];
-
-	    snprintf(reject, sizeof(reject), reject_fmt, context->sender, context->addr, context->site);
-	    smfi_setreply(ctx, "550", "5.1.1", reject);
-	    return SMFIS_REJECT;
+	if ((ret = check_reject(context->status, ctx, context)) != SMFIS_CONTINUE) {
+	    return ret;
 	}
     }
     if (conf.quarantine && (context->status == SPF_RESULT_FAIL || context->status == SPF_RESULT_SOFTFAIL)) add_rcpt(context);
@@ -864,40 +1237,11 @@ static sfsistat smf_eom(SMFICTX *ctx) {
 	    free(subj);
 	}
     }
-    if (conf.add_header) {
-	char *spf_hdr = NULL;
 
-	/* TODO: make verbosity configurable */
-	smfi_addheader(ctx, "X-SPF-Scan-By", "smf-spf v2.0.2 - http://smfs.sf.net/");
-	if ((spf_hdr = calloc(1, 512))) {
-	    switch (context->status) {
-		case SPF_RESULT_PASS:
-		    snprintf(spf_hdr, 512, "Pass (%s: domain of %s\n\tdesignates %s as permitted sender)\n\treceiver=%s; client-ip=%s;\n\tenvelope-from=%s; helo=%s;",
-			context->site, context->sender, context->addr, context->site, context->addr, context->from, context->helo);
-		    break;
-		case SPF_RESULT_FAIL:
-		    snprintf(spf_hdr, 512, "Fail (%s: domain of %s\n\tdoes not designate %s as permitted sender)\n\treceiver=%s; client-ip=%s;\n\tenvelope-from=%s; helo=%s;",
-			context->site, context->sender, context->addr, context->site, context->addr, context->from, context->helo);
-		    break;
-		case SPF_RESULT_SOFTFAIL:
-		    snprintf(spf_hdr, 512, "SoftFail (%s: transitioning domain of %s\n\tdoes not designate %s as permitted sender)\n\treceiver=%s; client-ip=%s;\n\tenvelope-from=%s; helo=%s;",
-			context->site, context->sender, context->addr, context->site, context->addr, context->from, context->helo);
-		    break;
-		case SPF_RESULT_NEUTRAL:
-		    snprintf(spf_hdr, 512, "Neutral (%s: %s is neither permitted\n\tnor denied by domain of %s)\n\treceiver=%s; client-ip=%s;\n\tenvelope-from=%s; helo=%s;",
-			context->site, context->addr, context->sender, context->site, context->addr, context->from, context->helo);
-		    break;
-		case SPF_RESULT_NONE:
-		default:
-		    snprintf(spf_hdr, 512, "None (%s: domain of %s\n\tdoes not designate permitted sender hosts)\n\treceiver=%s; client-ip=%s;\n\tenvelope-from=%s; helo=%s;",
-			context->site, context->sender, context->site, context->addr, context->from, context->helo);
-		    break;
-	    }
-	    /* BUG? should be smfi_insheader to go above Received:, as it should per RFC */
-	    smfi_addheader(ctx, "Received-SPF", spf_hdr);
-	    free(spf_hdr);
-	}
+    if (conf.received_header_format || conf.add_authresult_header) {
+        insert_headers(ctx, context);
     }
+
     if (context->rcpts) {
 	STR *it = context->rcpts;
 
