@@ -217,6 +217,7 @@ static sfsistat smf_envrcpt(SMFICTX *, char **);
 static sfsistat smf_data(SMFICTX *);
 static sfsistat smf_header(SMFICTX *, char *, char *);
 static sfsistat smf_eom(SMFICTX *);
+static sfsistat smf_abort(SMFICTX *);
 static sfsistat smf_close(SMFICTX *);
 
 static void strscpy(register char *dst, register const char *src, size_t size) {
@@ -867,7 +868,7 @@ static int safe_ret(size_t size, int nchars) {
     return nchars;
 }
 
-static SPF_result_t fixup_result(SPF_result_t status, SPF_errcode_t errcode)
+static SPF_result_t fixup_libspf2_result(SPF_result_t status, SPF_errcode_t errcode)
 {
     /* Buggy libspf2 often does not assign a result code in case of an error */
     if (status == SPF_RESULT_INVALID) {
@@ -1006,6 +1007,10 @@ static void insert_headers(SMFICTX *ctx, const struct context *context) {
 
 static void free_msgdata(struct context *context) {
     if (!context) return;
+    context->check_done = 0;
+    context->is_bounce = 0;
+    context->bounce_rcpt_ok = 0;
+    context->nrcpt = 0;
     if (context->rcpts) {
 	STR *it = context->rcpts, *it_next;
 	while (it) {
@@ -1066,7 +1071,7 @@ static sfsistat check_spf(SMFICTX *ctx, struct context *context) {
 	errcode = SPF_request_query_mailfrom(spf_request, &spf_response);
 	if (!spf_response) goto nomem1;
 	status = SPF_response_result(spf_response);
-	status = fixup_result(status, errcode);
+	status = fixup_libspf2_result(status, errcode);
 	if (do_cache && status != SPF_RESULT_INVALID && status != SPF_RESULT_TEMPERROR) {
 	    mutex_lock(&cache_mutex);
 	    cache_put(key, conf.spf_ttl, status, errcode);
@@ -1153,9 +1158,8 @@ static sfsistat smf_connect(SMFICTX *ctx, char *name, _SOCK_ADDR *sa) {
     if (conf.cidrs && ip_check(in_addr, addr_family)) return SMFIS_ACCEPT;
     if (conf.ptrs && ptr_check(name)) return SMFIS_ACCEPT;
     if (!(context = calloc(1, sizeof(*context)))) {
-	/* FIXME: tempfail instead? */
 	syslog(LOG_ERR, "[ERROR] %s", strerror(errno));
-	return SMFIS_ACCEPT;
+	return SMFIS_TEMPFAIL;
     }
     smfi_setpriv(ctx, context);
     strscpy(context->addr, host, sizeof(context->addr) - 1);
@@ -1198,11 +1202,6 @@ static sfsistat smf_envfrom(SMFICTX *ctx, char **args) {
 	    return SMFIS_ACCEPT;
 	}
     }
-    /* Make sure data from any previous message in this connection is released */
-    /* TODO: move into smf_eom/smf_abort ? */
-    context->nrcpt = 0;
-    free_msgdata(context);
-
     site = smfi_getsymval(ctx, "j");
     strscpy(context->site, ((site != NULL) ? site : "localhost"), sizeof(context->site) - 1);
 
@@ -1220,16 +1219,15 @@ static sfsistat smf_envrcpt(SMFICTX *ctx, char **args) {
     int match = 0;
 
     if (!rcpt || (len = strlen(rcpt)) == 0) {
-      syslog(LOG_ERR, "[ERROR] NULL recipient?" );
-      /* FIXME: reject */
-      return SMFIS_ACCEPT;
+	syslog(LOG_ERR, "[ERROR] NULL recipient?" );
+	smfi_setreply(ctx, "550", "5.1.3", "Bad recipient address");
+	return SMFIS_REJECT;
     }
     context->nrcpt++;
     recipient = (char*)malloc(len+1);
     if (!recipient) {
-	/* FIXME: tempfail */
 	syslog(LOG_ERR, "[ERROR] %s", strerror(errno));
-	return SMFIS_ACCEPT;
+	return SMFIS_TEMPFAIL;
     }
     if (!address_preparation(recipient, rcpt)) {
 	smfi_setreply(ctx, "550", "5.1.3", "Recipient address does not conform to RFC-2821 syntax");
@@ -1283,6 +1281,9 @@ static sfsistat smf_data(SMFICTX *ctx) {
 static sfsistat smf_header(SMFICTX *ctx, char *name, char *value) {
     struct context *context = (struct context *)smfi_getpriv(ctx);
 
+#ifdef SMF_DEBUG
+    syslog(LOG_NOTICE, "header");
+#endif
     if (!strcasecmp(name, "Subject") && (context->status == SPF_RESULT_FAIL || context->status == SPF_RESULT_SOFTFAIL) &&
 	conf.tag_subject && !context->subject) {
 	context->subject = strdup(value);
@@ -1294,52 +1295,63 @@ static sfsistat smf_eom(SMFICTX *ctx) {
     struct context *context = (struct context *)smfi_getpriv(ctx);
 
     if (!context) return SMFIS_CONTINUE;
-    if (!context->check_done) return SMFIS_CONTINUE;
-    if ((context->status == SPF_RESULT_FAIL || context->status == SPF_RESULT_SOFTFAIL) && conf.tag_subject) {
-	char *subj = NULL;
 
-	if (context->subject) {
-	    size_t len = strlen(context->subject) + strlen(conf.tag) + 2;
+    if (context->check_done) {
+	if ((context->status == SPF_RESULT_FAIL || context->status == SPF_RESULT_SOFTFAIL) && conf.tag_subject) {
+	    char *subj = NULL;
 
-	    if ((subj = calloc(1, len))) snprintf(subj, len, "%s %s", conf.tag, context->subject);
-	}
-	else {
-	    size_t len = strlen(conf.tag) + 1;
+	    if (context->subject) {
+		size_t len = strlen(context->subject) + strlen(conf.tag) + 2;
 
-	    if ((subj = calloc(1, len))) snprintf(subj, len, "%s", conf.tag);
-	}
-	if (subj) {
-	    if (context->subject)
-		smfi_chgheader(ctx, "Subject", 1, subj);
-	    else
-		smfi_addheader(ctx, "Subject", subj);
-	    free(subj);
-	}
-    }
-
-    if (conf.received_header_format || conf.add_authresult_header) {
-        insert_headers(ctx, context);
-    }
-
-    if (context->rcpts) {
-	STR *it = context->rcpts;
-
-	while (it) {
-	    if (it->str) {
-		smfi_delrcpt(ctx, it->str);
-		smfi_addheader(ctx, "X-SPF-Original-To", it->str);
+		if ((subj = calloc(1, len))) snprintf(subj, len, "%s %s", conf.tag, context->subject);
 	    }
-	    it = it->next;
+	    else {
+		size_t len = strlen(conf.tag) + 1;
+
+		if ((subj = calloc(1, len))) snprintf(subj, len, "%s", conf.tag);
+	    }
+	    if (subj) {
+		if (context->subject)
+		    smfi_chgheader(ctx, "Subject", 1, subj);
+		else
+		     smfi_addheader(ctx, "Subject", subj);
+		free(subj);
+	    }
 	}
-	smfi_addrcpt(ctx, conf.quarantine_box);
+
+	if (conf.received_header_format || conf.add_authresult_header) {
+	    insert_headers(ctx, context);
+	}
+
+	if (context->rcpts) {
+	    STR *it = context->rcpts;
+
+	    while (it) {
+		if (it->str) {
+		    smfi_delrcpt(ctx, it->str);
+		    smfi_addheader(ctx, "X-SPF-Original-To", it->str);
+		}
+		it = it->next;
+	    }
+	    smfi_addrcpt(ctx, conf.quarantine_box);
+	}
     }
+    free_msgdata(context);
+    return SMFIS_CONTINUE;
+}
+
+static sfsistat smf_abort(SMFICTX *ctx) {
+    struct context *context = (struct context *)smfi_getpriv(ctx);
+
+    free_msgdata(context);
     return SMFIS_CONTINUE;
 }
 
 static sfsistat smf_close(SMFICTX *ctx) {
     struct context *context = (struct context *)smfi_getpriv(ctx);
 
-    free_msgdata(context);
+    assert(!context || (context->rcpts == NULL && context->subject == NULL));
+/*     free_msgdata(context); */
     SAFE_FREE(context);
     smfi_setpriv(ctx, NULL);
     return SMFIS_CONTINUE;
@@ -1357,7 +1369,7 @@ struct smfiDesc smfilter = {
     NULL,
     NULL,
     smf_eom,
-    NULL,
+    smf_abort,
     smf_close,
     NULL,
     smf_data,

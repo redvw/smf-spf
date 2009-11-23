@@ -28,7 +28,7 @@ smf-spf.o: smf-spf.c
 	$(CC) $(CFLAGS) -c smf-spf.c
 
 clean:
-	rm -f smf-spf.o smf-spf
+	rm -f smf-spf.o smf-spf *~
 
 install:
 	@./install.sh
