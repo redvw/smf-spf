@@ -5,7 +5,8 @@ DATADIR = /var/run/smfs
 CONFDIR = /etc/mail/smfs
 USER = smfs
 GROUP = smfs
-CFLAGS = $(OPTFLAGS) -D_REENTRANT -fomit-frame-pointer
+PROG = smf-spf
+#DEBUG = 1
 
 # Linux
 LDFLAGS = -lmilter -lpthread -lspf2
@@ -19,20 +20,28 @@ LDFLAGS = -lmilter -lpthread -lspf2
 # Sendmail v8.11
 #LDFLAGS += -lsmutil
 
-all: smf-spf
+ifdef DEBUG
+CFLAGS = -g -O0
+else
+CFLAGS = $(OPTFLAGS) -DNDEBUG
+endif
+CFLAGS += -D_REENTRANT -fomit-frame-pointer
 
-smf-spf: smf-spf.o
-	$(CC) -o smf-spf smf-spf.o $(LDFLAGS)
 
-smf-spf.o: smf-spf.c
-	$(CC) $(CFLAGS) -c smf-spf.c
+all:	$(PROG)
+
+$(PROG): $(PROG).o
+	$(CC) $(LDFLAGS) -o $@ $^
+
+%.o:	%.c
+	$(CC) $(CFLAGS) -c $<
 
 clean:
 	rm -f smf-spf.o smf-spf *~
 
 install:
 	@./install.sh
-	@cp -f -p smf-spf $(SBINDIR)
+	@cp -f -p $(PROG) $(SBINDIR)
 	@if test ! -d $(DATADIR); then \
 	mkdir -m 700 $(DATADIR); \
 	chown $(USER):$(GROUP) $(DATADIR); \
@@ -40,9 +49,9 @@ install:
 	@if test ! -d $(CONFDIR); then \
 	mkdir -m 755 $(CONFDIR); \
 	fi
-	@if test ! -f $(CONFDIR)/smf-spf.conf; then \
-	cp -p smf-spf.conf $(CONFDIR)/smf-spf.conf; \
+	@if test ! -f $(CONFDIR)/$(PROG).conf; then \
+	cp -p $(PROG).conf $(CONFDIR)/$(PROG).conf; \
 	else \
-	cp -p smf-spf.conf $(CONFDIR)/smf-spf.conf.new; \
+	cp -p $(PROG).conf $(CONFDIR)/$(PROG).conf.new; \
 	fi
-	@echo Please, inspect and edit the $(CONFDIR)/smf-spf.conf file.
+	@echo Please, inspect and edit the $(CONFDIR)/$(PROG).conf file.

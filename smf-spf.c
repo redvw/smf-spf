@@ -47,6 +47,7 @@
 #include <assert.h>
 #include <spf2/spf.h>
 
+/* TODO: use compilation-time defines to set these */
 #define CONFIG_FILE		"/etc/mail/smfs/smf-spf.conf"
 #define WORK_SPACE		"/var/run/smfs"
 #define OCONN			"unix:" WORK_SPACE "/smf-spf.sock"
@@ -192,6 +193,9 @@ struct context {
     SPF_result_t status;
     SPF_errcode_t errcode;
 };
+
+/* The thread-safe SPF server, allocated in main() */
+static SPF_server_t *spf_server = NULL;
 
 static cache_item **cache = NULL;
 static const char *config_file = CONFIG_FILE;
@@ -1025,7 +1029,6 @@ static void free_msgdata(struct context *context) {
 }
 
 static sfsistat check_spf(SMFICTX *ctx, struct context *context) {
-    SPF_server_t *spf_server = NULL;
     SPF_request_t *spf_request = NULL;
     SPF_response_t *spf_response = NULL;
     SPF_result_t status = SPF_RESULT_NONE;
@@ -1052,12 +1055,6 @@ static sfsistat check_spf(SMFICTX *ctx, struct context *context) {
 	cache_notice = " (cached)";
 	badalloc = 0;
     } else {
-	/* FIXME: start one single server at program startup */
-	if (!(spf_server = SPF_server_new(SPF_DNS_RESOLV, 0))) {
-	    syslog(LOG_ERR, "[ERROR] SPF engine init failed");
-	    goto nomem;
-	}
-	/* ----- */
 	SPF_server_set_rec_dom(spf_server, context->site);
 	spf_request = SPF_request_new(spf_server);
 	if (!spf_request) goto nomem1;
@@ -1081,7 +1078,6 @@ static sfsistat check_spf(SMFICTX *ctx, struct context *context) {
 	SPF_response_free(spf_response);
     nomem1:
 	if (spf_request) SPF_request_free(spf_request);
-	if (spf_server) SPF_server_free(spf_server);
     }
 nomem:
     if (badalloc) {
@@ -1276,14 +1272,12 @@ static sfsistat smf_data(SMFICTX *ctx) {
 	/* FIXME: should indicate identity=helo somehow */
 	return check_spf(ctx, context);
     }
+    return SMFIS_CONTINUE;
 }
 
 static sfsistat smf_header(SMFICTX *ctx, char *name, char *value) {
     struct context *context = (struct context *)smfi_getpriv(ctx);
 
-#ifdef SMF_DEBUG
-    syslog(LOG_NOTICE, "header");
-#endif
     if (!strcasecmp(name, "Subject") && (context->status == SPF_RESULT_FAIL || context->status == SPF_RESULT_SOFTFAIL) &&
 	conf.tag_subject && !context->subject) {
 	context->subject = strdup(value);
@@ -1351,7 +1345,6 @@ static sfsistat smf_close(SMFICTX *ctx) {
     struct context *context = (struct context *)smfi_getpriv(ctx);
 
     assert(!context || (context->rcpts == NULL && context->subject == NULL));
-/*     free_msgdata(context); */
     SAFE_FREE(context);
     smfi_setpriv(ctx, NULL);
     return SMFIS_CONTINUE;
@@ -1396,6 +1389,11 @@ int main(int argc, char **argv) {
     if (!load_config()) fprintf(stderr, "Warning: smf-spf configuration file load failed\n");
     tzset();
     openlog("smf-spf", LOG_PID|LOG_NDELAY, conf.syslog_facility);
+    if (!(spf_server = SPF_server_new(SPF_DNS_RESOLV, 0))) {
+	syslog(LOG_ERR, "[ERROR] SPF server init failed");
+	fprintf(stderr, "failed to create SPF_server\n");
+	goto done;
+    }
     if (!strncmp(conf.sendmail_socket, "unix:", 5))
 	ofile = conf.sendmail_socket + 5;
     else
@@ -1441,6 +1439,7 @@ int main(int argc, char **argv) {
     if (cache) cache_destroy();
     pthread_mutex_destroy(&cache_mutex);
 done:
+    if (spf_server) SPF_server_free(spf_server);
     free_config();
     closelog();
     return ret;
