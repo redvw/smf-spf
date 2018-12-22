@@ -1,0 +1,15 @@
+[Unit]
+Description=Sender Policy Framework (SPF) mail filter
+After=network.target nss-lookup.target syslog.target
+Before=postfix.service sendmail.service
+
+[Service]
+Type=forking
+Environment = OPTIONS=
+EnvironmentFile=-@sysconfdir@/sysconfig/@name@
+ExecStart=@sbindir@/@name@ $OPTIONS
+User=@user@
+Group=@user@
+
+[Install]
+WantedBy=multi-user.target

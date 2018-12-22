@@ -780,9 +780,9 @@ static void add_rcpt(struct context *context, const char* rcpt) {
 
 static void wrap_header(char* header, size_t len, size_t indent, size_t width) {
     const size_t tab = 8;
-    size_t nchars, pos;
+    size_t nchars, pos, buflen;
     char *buf, *p, *q, *start;
-    int buflen, spc, newchars, startline;
+    int spc, newchars, startline;
 
     if (!header || indent>=width || width<2*tab)
         return;
@@ -923,9 +923,11 @@ static int write_spf_txt(char *spf_txt, size_t LEN, const struct context *contex
     case SPF_RESULT_TEMPERROR:
 	nchars = safe_ret(LEN, snprintf(spf_txt, LEN, " (%s: error in processing during lookup of %s: %s)",
 					context->site, context->sender, SPF_strerror(context->errcode)));
+	break;
     case SPF_RESULT_PERMERROR:
 	nchars = safe_ret(LEN, snprintf(spf_txt, LEN, " (%s: unrecoverable error during lookup of %s: %s)",
 					context->site, context->sender, SPF_strerror(context->errcode)));
+	break;
     default:
         break;
     }
@@ -1099,7 +1101,8 @@ nomem:
     context->errcode = errcode;
     context->check_done = 1;
     if (status == SPF_RESULT_FAIL && conf.refuse_fail) {
-	char reject[2 * MAXLINE];
+        char reject[sizeof(context->sender)+sizeof(context->addr)+
+		    sizeof(context->site)+66];
 	snprintf(reject, sizeof(reject), "Rejected. See http://www.openspf.org/why.html?sender=%s&ip=%s&receiver=%s",
 		 context->sender, context->addr, context->site);
 	smfi_setreply(ctx, "550", "5.7.1", reject);
@@ -1187,7 +1190,7 @@ static sfsistat smf_envfrom(SMFICTX *ctx, char **args) {
     if (strstr(context->from, "<>")) {
 	context->is_bounce = 1;
 	strtolower(context->helo);
-	snprintf(context->sender, sizeof(context->sender), "postmaster@%s", context->helo);
+	snprintf(context->sender, sizeof(context->sender), "postmaster@%.115s", context->helo);
     } else {
 	if (!address_preparation(context->sender, context->from)) {
 	    smfi_setreply(ctx, "550", "5.1.7", "Sender address does not conform to RFC-2821 syntax");
@@ -1263,7 +1266,6 @@ static sfsistat smf_envrcpt(SMFICTX *ctx, char **args) {
 static sfsistat smf_data(SMFICTX *ctx) {
     struct context *context = (struct context *)smfi_getpriv(ctx);
 
-    /* FIXME: add NDEBUG to Makefile */
     assert(!(context->is_bounce && context->check_done));
     assert(!(context->bounce_rcpt_ok && !context->is_bounce));
 

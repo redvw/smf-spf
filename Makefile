@@ -20,6 +20,10 @@ LDFLAGS = -lmilter -lpthread -lspf2
 # Sendmail v8.11
 #LDFLAGS += -lsmutil
 
+ifndef OPTFLAGS
+OPTFLAGS = -O2 -g
+endif
+
 ifdef DEBUG
 CFLAGS = -g -O0
 else

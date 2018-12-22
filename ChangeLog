@@ -1,3 +1,47 @@
+Thu Dec 20 2018 (oh)
+====================
+smf-spf v.2.2.3
+
+  + Add systemd unit file template
+  + Fix minor bugs flagged by compiler warnings
+
+Tue Nov 24 2009 (oh)
+====================
+smf-spf v.2.2.2
+
+  ! Performance: create libspf2 server only once at startup,
+    not once per connection
+
+Mon Nov 23 2009 (oh)
+====================
+smf-spf v.2.2.1
+
+  ! Clear message context properly
+
+Sat Oct 24 2009 (oh)
+====================
+smf-spf v.2.2.0
+
+  + Option to delay SPF checks until RCPT/DATA
+
+Thu Oct 8 2009 (oh)
+===================
+smf-spf v.2.1.0
+
+  + Options to fail delivery on SPF temperror and permerror
+  + Better handling and reporting of errors from libspf2
+  + More RFC-compliant headers, better formatting
+  + Make Received-SPF header format configurable
+  + Option to wrap headers at a configurable width
+  + Option to write Authentication-Results header
+  + Add sendmail job ID to syslog messages
+
+Sun Sep 6 2009 (oh)
+===================
+smf-spf v.2.0.3
+
+  + IPv6 support
+
 Wed Jan 10 2007 (ek)
 ====================
 smf-spf v2.0.2
