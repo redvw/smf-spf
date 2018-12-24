@@ -44,7 +44,7 @@ clean:
 	rm -f smf-spf.o smf-spf *~
 
 install:
-	@./install.sh
+	@./add-smfs-user.sh
 	@cp -f -p $(PROG) $(SBINDIR)
 	@if test ! -d $(DATADIR); then \
 	mkdir -m 700 $(DATADIR); \

@@ -2,6 +2,7 @@
 
 USER=smfs
 GROUP=smfs
+HOMEDIR=/etc/mail/$USER
 UNAME=`uname`
 PATH=$PATH:/sbin:/bin:/usr/sbin:/usr/bin
 
@@ -24,13 +25,13 @@ if grep "^$USER:" /etc/passwd > /dev/null ; then
 else
     case $UNAME in
 	SunOS)
-	    useradd -g $GROUP -d /dev/null -s /usr/bin/false $USER
+	    useradd -g $GROUP -d $HOMEDIR -s /usr/bin/false $USER
 	    ;;
 	*BSD)
-	    pw useradd -c SMFS -g $GROUP -n $USER -d /nonexistent -s /usr/sbin/nologin
+	    pw useradd -c SMFS -g $GROUP -n $USER -d $HOMEDIR -s /usr/sbin/nologin
 	    ;;
 	*)
-	    useradd -g $GROUP $USER -d /dev/null -s /usr/bin/false
+	    useradd -g $GROUP $USER -d $HOMEDIR -s /usr/bin/false
     esac
 fi
 echo "done."

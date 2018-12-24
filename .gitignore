@@ -1,2 +1,7 @@
 *.o
+*~
 smf-spf
+build/
+CMake*
+*.cmake
+*.txt

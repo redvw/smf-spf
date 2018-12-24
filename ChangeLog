@@ -1,3 +1,10 @@
+Sun Dec 23 2018 (oh)
+====================
+smf-spf v.2.2.4
+
+  + Optional CMake support (should auto-configure on all platforms)
+  ! Documentation updates
+
 Thu Dec 20 2018 (oh)
 ====================
 smf-spf v.2.2.3
